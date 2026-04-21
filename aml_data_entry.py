@@ -1,7 +1,6 @@
 import streamlit as st
 import requests
 import json
-import uuid
 from datetime import datetime, date
 import tempfile
 import os
@@ -9,11 +8,12 @@ import os
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
-#GATEWAY_URL = st.secrets.get("API_BASE_URL", "http://20.87.96.47:8000")
-#JWT_TOKEN = st.secrets.get("JWT_TOKEN", "enter_jwt_token_here")
 GATEWAY_URL = st.secrets.get("API_BASE_URL")
 JWT_TOKEN = st.secrets.get("JWT_TOKEN")
 
+# Ensure GATEWAY_URL has a scheme (http:// or https://)
+if not GATEWAY_URL.startswith(("http://", "https://")):
+    GATEWAY_URL = "http://" + GATEWAY_URL
 
 HEADERS = {"Authorization": f"Bearer {JWT_TOKEN}"}
 
@@ -29,46 +29,56 @@ def submit_record(record_type: str, record_data: dict) -> tuple:
     Submits a single record (customer, account, or transaction) to the AML gateway.
     Returns (success, message).
     """
-    # Create a temporary JSON file with the single record
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-        json.dump([record_data], f, indent=2)  # Batch expects list
-        temp_path = f.name
-
-    # Prepare files for the batch endpoint
-    files = {}
-    if record_type == "customer":
-        files["customers"] = ("customers.json", open(temp_path, "rb"), "application/json")
-        files["accounts"] = ("accounts.json", open(tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False).name, "w"), "application/json")
-        files["transactions"] = ("transactions.json", open(tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False).name, "w"), "application/json")
-        # Write empty lists for the other two files
-        with open(files["accounts"][1].name, "w") as empty:
-            json.dump([], empty)
-        with open(files["transactions"][1].name, "w") as empty:
-            json.dump([], empty)
-    elif record_type == "account":
-        files["accounts"] = ("accounts.json", open(temp_path, "rb"), "application/json")
-        files["customers"] = ("customers.json", open(tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False).name, "w"), "application/json")
-        files["transactions"] = ("transactions.json", open(tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False).name, "w"), "application/json")
-        with open(files["customers"][1].name, "w") as empty:
-            json.dump([], empty)
-        with open(files["transactions"][1].name, "w") as empty:
-            json.dump([], empty)
-    else:  # transaction
-        files["transactions"] = ("transactions.json", open(temp_path, "rb"), "application/json")
-        files["accounts"] = ("accounts.json", open(tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False).name, "w"), "application/json")
-        files["customers"] = ("customers.json", open(tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False).name, "w"), "application/json")
-        with open(files["accounts"][1].name, "w") as empty:
-            json.dump([], empty)
-        with open(files["customers"][1].name, "w") as empty:
-            json.dump([], empty)
-
+    temp_files = {}
     try:
+        # Create temporary files for customers, accounts, transactions
+        # For the record type being added, put the data; for others, put an empty list.
+        if record_type == "customer":
+            customers_data = [record_data]
+            accounts_data = []
+            transactions_data = []
+        elif record_type == "account":
+            customers_data = []
+            accounts_data = [record_data]
+            transactions_data = []
+        else:  # transaction
+            customers_data = []
+            accounts_data = []
+            transactions_data = [record_data]
+
+        # Write customers.json
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(customers_data, f, indent=2)
+            temp_files["customers"] = f.name
+
+        # Write accounts.json
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(accounts_data, f, indent=2)
+            temp_files["accounts"] = f.name
+
+        # Write transactions.json
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(transactions_data, f, indent=2)
+            temp_files["transactions"] = f.name
+
+        # Prepare files for upload (open in binary read mode)
+        files = {
+            'accounts': ('accounts.json', open(temp_files["accounts"], 'rb'), 'application/json'),
+            'customers': ('customers.json', open(temp_files["customers"], 'rb'), 'application/json'),
+            'transactions': ('transactions.json', open(temp_files["transactions"], 'rb'), 'application/json')
+        }
+
         response = requests.post(
             f"{GATEWAY_URL}/v1/batch",
             files=files,
             headers=HEADERS,
             timeout=60
         )
+
+        # Close all file handles
+        for f in files.values():
+            f[1].close()
+
         if response.status_code in (200, 201):
             result = response.json()
             return True, f"Success! Batch ID: {result.get('batch_id')}, records processed: {result.get('records_processed')}"
@@ -77,11 +87,10 @@ def submit_record(record_type: str, record_data: dict) -> tuple:
     except Exception as e:
         return False, f"Exception: {str(e)}"
     finally:
-        # Clean up temp files
-        os.unlink(temp_path)
-        for f in files.values():
+        # Clean up temporary files
+        for path in temp_files.values():
             try:
-                os.unlink(f[1].name)
+                os.unlink(path)
             except:
                 pass
 
@@ -206,7 +215,7 @@ with st.expander("➕ Add New Transaction", expanded=False):
                     st.error(msg)
 
 # ----------------------------------------------------------------------
-# Sidebar: Quick view of recent alerts (optional)
+# Sidebar: Quick view of recent alerts (URL scheme already fixed)
 # ----------------------------------------------------------------------
 st.sidebar.header("🔍 Live Alerts Preview")
 if st.sidebar.button("Refresh Alerts"):
@@ -220,7 +229,7 @@ if st.sidebar.button("Refresh Alerts"):
             else:
                 st.sidebar.info("No alerts yet.")
         else:
-            st.sidebar.error("Could not fetch alerts.")
+            st.sidebar.error(f"Could not fetch alerts (HTTP {resp.status_code}).")
     except Exception as e:
         st.sidebar.error(f"Error: {e}")
 
